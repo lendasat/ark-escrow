@@ -1,0 +1,333 @@
+use anyhow::{Result, anyhow, bail};
+use ark_core::{ArkAddress, UNSPENDABLE_KEY};
+use bitcoin::opcodes::all::*;
+use bitcoin::taproot::{ControlBlock, TaprootBuilder, TaprootSpendInfo};
+use bitcoin::{Network, PublicKey, ScriptBuf, XOnlyPublicKey};
+use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+
+/// Configuration for a 2-of-3 escrow contract on Arkade.
+///
+/// Any two of {alice, bob, arbiter} can spend. Collaborative paths include the
+/// Arkade server signature; unilateral paths use CSV delay instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EscrowOptions {
+    /// Alice's public key (the party funding the escrow).
+    pub alice: XOnlyPublicKey,
+    /// Bob's public key (the party receiving bitcoin on release).
+    pub bob: XOnlyPublicKey,
+    /// Arbiter's public key (HodlHodl).
+    pub arbiter: XOnlyPublicKey,
+    /// Arkade server's public key.
+    pub server: XOnlyPublicKey,
+    /// CSV delay for unilateral exit paths (no server needed).
+    pub unilateral_exit_delay: bitcoin::Sequence,
+}
+
+impl EscrowOptions {
+    /// Validate that all keys are distinct and the delay is non-zero.
+    pub fn validate(&self) -> Result<()> {
+        let keys = [self.alice, self.bob, self.arbiter, self.server];
+        for i in 0..keys.len() {
+            for j in (i + 1)..keys.len() {
+                if keys[i] == keys[j] {
+                    bail!("all public keys must be distinct");
+                }
+            }
+        }
+
+        let delay = self.unilateral_exit_delay.to_consensus_u32();
+        if delay == 0 {
+            bail!("unilateral_exit_delay must be non-zero");
+        }
+
+        Ok(())
+    }
+
+    // -- Collaborative leaves (include server_pk) --
+
+    /// Leaf 1: alice + arbiter + server — arbiter-assisted refund to Alice.
+    pub fn alice_arbiter_script(&self) -> ScriptBuf {
+        collaborative_3of3(self.alice, self.arbiter, self.server)
+    }
+
+    /// Leaf 2: bob + arbiter + server — arbiter-assisted release to Bob (happy path).
+    pub fn bob_arbiter_script(&self) -> ScriptBuf {
+        collaborative_3of3(self.bob, self.arbiter, self.server)
+    }
+
+    /// Leaf 3: alice + bob + server — mutual settlement, no arbiter needed.
+    pub fn alice_bob_script(&self) -> ScriptBuf {
+        collaborative_3of3(self.alice, self.bob, self.server)
+    }
+
+    // -- Unilateral leaves (CSV delay, no server) --
+
+    /// Leaf 4: CSV + alice + arbiter — unilateral refund.
+    pub fn unilateral_alice_arbiter_script(&self) -> ScriptBuf {
+        unilateral_2of2(self.unilateral_exit_delay, self.alice, self.arbiter)
+    }
+
+    /// Leaf 5: CSV + bob + arbiter — unilateral release.
+    pub fn unilateral_bob_arbiter_script(&self) -> ScriptBuf {
+        unilateral_2of2(self.unilateral_exit_delay, self.bob, self.arbiter)
+    }
+
+    /// Leaf 6: CSV + alice + bob — unilateral mutual settlement.
+    pub fn unilateral_alice_bob_script(&self) -> ScriptBuf {
+        unilateral_2of2(self.unilateral_exit_delay, self.alice, self.bob)
+    }
+}
+
+/// The escrow contract: wraps options + computed taproot spend info.
+pub struct EscrowContract {
+    options: EscrowOptions,
+    spend_info: TaprootSpendInfo,
+    network: Network,
+}
+
+impl EscrowContract {
+    pub fn new(options: EscrowOptions, network: Network) -> Result<Self> {
+        options.validate()?;
+        let spend_info = build_taproot(&options)?;
+        Ok(Self {
+            options,
+            spend_info,
+            network,
+        })
+    }
+
+    pub fn options(&self) -> &EscrowOptions {
+        &self.options
+    }
+
+    pub fn spend_info(&self) -> &TaprootSpendInfo {
+        &self.spend_info
+    }
+
+    pub fn script_pubkey(&self) -> ScriptBuf {
+        ScriptBuf::builder()
+            .push_opcode(OP_PUSHNUM_1)
+            .push_slice(self.spend_info.output_key().serialize())
+            .into_script()
+    }
+
+    pub fn address(&self) -> ArkAddress {
+        ArkAddress::new(
+            self.network,
+            self.options.server,
+            self.spend_info.output_key(),
+        )
+    }
+
+    /// All 6 tapscripts in tree order (collaborative then unilateral).
+    pub fn tapscripts(&self) -> Vec<ScriptBuf> {
+        vec![
+            self.options.alice_arbiter_script(),
+            self.options.bob_arbiter_script(),
+            self.options.alice_bob_script(),
+            self.options.unilateral_alice_arbiter_script(),
+            self.options.unilateral_bob_arbiter_script(),
+            self.options.unilateral_alice_bob_script(),
+        ]
+    }
+
+    /// Get the control block for spending via a specific leaf script.
+    pub fn control_block(&self, script: &ScriptBuf) -> Result<ControlBlock> {
+        self.spend_info
+            .control_block(&(script.clone(), bitcoin::taproot::LeafVersion::TapScript))
+            .ok_or_else(|| anyhow!("script not found in taproot tree"))
+    }
+}
+
+// -- Script builders --
+
+fn collaborative_3of3(
+    pk_a: XOnlyPublicKey,
+    pk_b: XOnlyPublicKey,
+    server: XOnlyPublicKey,
+) -> ScriptBuf {
+    ScriptBuf::builder()
+        .push_x_only_key(&pk_a)
+        .push_opcode(OP_CHECKSIGVERIFY)
+        .push_x_only_key(&pk_b)
+        .push_opcode(OP_CHECKSIGVERIFY)
+        .push_x_only_key(&server)
+        .push_opcode(OP_CHECKSIG)
+        .into_script()
+}
+
+fn unilateral_2of2(
+    delay: bitcoin::Sequence,
+    pk_a: XOnlyPublicKey,
+    pk_b: XOnlyPublicKey,
+) -> ScriptBuf {
+    ScriptBuf::builder()
+        .push_int(delay.to_consensus_u32() as i64)
+        .push_opcode(OP_CSV)
+        .push_opcode(OP_DROP)
+        .push_x_only_key(&pk_a)
+        .push_opcode(OP_CHECKSIGVERIFY)
+        .push_x_only_key(&pk_b)
+        .push_opcode(OP_CHECKSIG)
+        .into_script()
+}
+
+// -- Taproot tree construction --
+// Ported from escrow-sample.rs: weight-based balanced tree for 6 leaves.
+
+#[derive(Clone)]
+enum TreeNode {
+    Leaf {
+        script: ScriptBuf,
+        weight: u32,
+    },
+    Branch {
+        left: Box<TreeNode>,
+        right: Box<TreeNode>,
+        weight: u32,
+    },
+}
+
+impl TreeNode {
+    fn weight(&self) -> u32 {
+        match self {
+            TreeNode::Leaf { weight, .. } | TreeNode::Branch { weight, .. } => *weight,
+        }
+    }
+}
+
+fn build_taproot(opts: &EscrowOptions) -> Result<TaprootSpendInfo> {
+    let internal_key =
+        XOnlyPublicKey::from(PublicKey::from_str(UNSPENDABLE_KEY).expect("valid unspendable key"));
+
+    // All leaves equal weight (balanced tree).
+    let scripts = vec![
+        opts.alice_arbiter_script(),
+        opts.bob_arbiter_script(),
+        opts.alice_bob_script(),
+        opts.unilateral_alice_arbiter_script(),
+        opts.unilateral_bob_arbiter_script(),
+        opts.unilateral_alice_bob_script(),
+    ];
+
+    let mut nodes: Vec<TreeNode> = scripts
+        .into_iter()
+        .map(|s| TreeNode::Leaf {
+            script: s,
+            weight: 1,
+        })
+        .collect();
+
+    // Build tree by repeatedly combining the two lightest nodes.
+    while nodes.len() >= 2 {
+        nodes.sort_by_key(|n| std::cmp::Reverse(n.weight()));
+        let b = nodes.pop().unwrap();
+        let a = nodes.pop().unwrap();
+        nodes.push(TreeNode::Branch {
+            weight: a.weight() + b.weight(),
+            left: Box::new(a),
+            right: Box::new(b),
+        });
+    }
+
+    let root = nodes.into_iter().next().unwrap();
+    let builder = add_to_builder(TaprootBuilder::new(), &root, 0)?;
+
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    builder
+        .finalize(&secp, internal_key)
+        .map_err(|_| anyhow!("failed to finalize taproot tree"))
+}
+
+fn add_to_builder(builder: TaprootBuilder, node: &TreeNode, depth: u8) -> Result<TaprootBuilder> {
+    match node {
+        TreeNode::Leaf { script, .. } => builder
+            .add_leaf(depth, script.clone())
+            .map_err(|_| anyhow!("failed to add leaf at depth {depth}")),
+        TreeNode::Branch { left, right, .. } => {
+            let builder = add_to_builder(builder, left, depth + 1)?;
+            add_to_builder(builder, right, depth + 1)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::key::Keypair;
+    use bitcoin::secp256k1::Secp256k1;
+
+    fn test_options() -> EscrowOptions {
+        let secp = Secp256k1::new();
+        let mut rng = bitcoin::secp256k1::rand::thread_rng();
+        let alice = Keypair::new(&secp, &mut rng).x_only_public_key().0;
+        let bob = Keypair::new(&secp, &mut rng).x_only_public_key().0;
+        let arbiter = Keypair::new(&secp, &mut rng).x_only_public_key().0;
+        let server = Keypair::new(&secp, &mut rng).x_only_public_key().0;
+
+        EscrowOptions {
+            alice,
+            bob,
+            arbiter,
+            server,
+            unilateral_exit_delay: bitcoin::Sequence(512),
+        }
+    }
+
+    #[test]
+    fn contract_address_is_deterministic() {
+        let opts = test_options();
+        let c1 = EscrowContract::new(opts.clone(), Network::Regtest).unwrap();
+        let c2 = EscrowContract::new(opts, Network::Regtest).unwrap();
+        assert_eq!(c1.address().to_string(), c2.address().to_string());
+    }
+
+    #[test]
+    fn contract_has_six_tapscripts() {
+        let opts = test_options();
+        let contract = EscrowContract::new(opts, Network::Regtest).unwrap();
+        assert_eq!(contract.tapscripts().len(), 6);
+    }
+
+    #[test]
+    fn control_blocks_exist_for_all_leaves() {
+        let opts = test_options();
+        let contract = EscrowContract::new(opts, Network::Regtest).unwrap();
+        for script in &contract.tapscripts() {
+            contract.control_block(script).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_keys() {
+        let secp = Secp256k1::new();
+        let mut rng = bitcoin::secp256k1::rand::thread_rng();
+        let k = Keypair::new(&secp, &mut rng).x_only_public_key().0;
+        let other = Keypair::new(&secp, &mut rng).x_only_public_key().0;
+
+        let opts = EscrowOptions {
+            alice: k,
+            bob: k,
+            arbiter: other,
+            server: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            unilateral_exit_delay: bitcoin::Sequence(512),
+        };
+        assert!(opts.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_delay() {
+        let secp = Secp256k1::new();
+        let mut rng = bitcoin::secp256k1::rand::thread_rng();
+
+        let opts = EscrowOptions {
+            alice: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            bob: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            arbiter: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            server: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            unilateral_exit_delay: bitcoin::Sequence(0),
+        };
+        assert!(opts.validate().is_err());
+    }
+}
