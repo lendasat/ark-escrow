@@ -1,6 +1,6 @@
 # Escrow PSBT Exchange Protocol
 
-This document describes the multi-step signing protocol for releasing or refunding an escrow VTXO on Arkade.
+This document describes the signing protocol for releasing or refunding an escrow VTXO on Arkade.
 
 ## Parties
 
@@ -22,66 +22,72 @@ This document describes the multi-step signing protocol for releasing or refundi
 
 The release uses the **Bob + Arbiter + Server** collaborative leaf.
 
+The client (Bob) signs all PSBTs in a **single round-trip**. PSBT
+`tap_script_sigs` are independent per-key, so Bob's and the arbiter's
+signatures can be collected before the Arkade server sees the checkpoints.
+
 ```
-┌─────────┐     ┌──────────┐     ┌──────────┐     ┌────────┐
-│  Bob    │     │ Arbiter  │     │  Server  │     │ Arkade │
-│(browser)│     │(backend) │     │  (gRPC)  │     │        │
-└────┬────┘     └────┬─────┘     └────┬─────┘     └───┬────┘
-     │               │               │               │
-     │  1. Request release            │               │
-     │──────────────>│               │               │
-     │               │               │               │
-     │               │ 2. build_release_tx()          │
-     │               │ 3. sign_ark_tx(arbiter_sk)     │
-     │               │               │               │
-     │  4. Return arbiter-signed PSBT │               │
-     │<──────────────│               │               │
-     │               │               │               │
-     │ 5. sign_ark_tx(bob_sk)        │               │
-     │ 6. Send bob-signed PSBT       │               │
-     │──────────────>│               │               │
-     │               │               │               │
-     │               │ 7. merge_sigs(arbiter, bob)    │
-     │               │ 8. submit(merged, checkpoints) │
+┌─────────┐     ┌──────────┐     ┌────────┐
+│  Bob    │     │ Arbiter  │     │ Arkade │
+│(browser)│     │(backend) │     │ (gRPC) │
+└────┬────┘     └────┬─────┘     └───┬────┘
+     │               │               │
+     │  1. Request release            │
+     │──────────────>│               │
+     │               │               │
+     │               │ 2. build_release_tx()
+     │               │ 3. sign_ark_tx(arbiter_sk)
+     │               │ 4. sign_checkpoint(arbiter_sk) × N
+     │               │               │
+     │  5. All arbiter-signed PSBTs  │
+     │<──────────────│               │
+     │               │               │
+     │ 6. sign_ark_tx(bob_sk)        │
+     │ 7. sign_checkpoints(bob_sk)   │
+     │ 8. Return all signed PSBTs    │
+     │──────────────>│               │
+     │               │               │
+     │               │ 9.  merge ark_tx sigs
+     │               │ 10. submit(merged_ark_tx, UNSIGNED checkpoints)
      │               │──────────────────────────────>│
      │               │               │               │
-     │               │ 9. Server-signed checkpoints   │
-     │               │<──────────────────────────────│
-     │               │               │               │
-     │               │ 10. sign_checkpoint(arbiter_sk)│
-     │  11. Return arbiter-signed checkpoints         │
-     │<──────────────│               │               │
-     │               │               │               │
-     │ 12. sign_checkpoint(bob_sk)   │               │
-     │ 13. Send bob-signed checkpoints│               │
-     │──────────────>│               │               │
-     │               │               │               │
-     │               │ 14. merge checkpoint sigs      │
-     │               │ 15. finalize(txid, checkpoints)│
+     │               │ 11. Server-signed checkpoints │
+     │               │<─────────────────────────────│
+     │               │               │
+     │               │ 12. merge arbiter cp sigs into server cps
+     │               │ 13. merge bob cp sigs into server cps
+     │               │ 14. finalize(txid, fully-signed cps)
      │               │──────────────────────────────>│
-     │               │               │               │
-     │  16. Done — escrow released   │               │
-     │<──────────────│               │               │
+     │               │               │
+     │  15. Done — escrow released   │
+     │<──────────────│               │
 ```
 
 ### Step-by-step
 
 1. **Bob requests release** — provides his destination Arkade address
 2. **Arbiter builds the release tx** — `build_release_tx()` produces unsigned `ark_tx` + `checkpoint_txs` PSBTs
-3. **Arbiter signs** — `sign_ark_tx(ark_tx, arbiter_sk)` adds arbiter's tapscript signature
-4. **Arbiter returns PSBTs** — sends arbiter-signed `ark_tx` + unsigned `checkpoint_txs` to Bob
-5. **Bob signs the ark_tx** — `sign_ark_tx(ark_tx, bob_sk)` or equivalent in TS
-6. **Bob returns signed ark_tx** to the arbiter
-7. **Arbiter merges signatures** — `merge_ark_tx_sigs(arbiter_signed, bob_signed)`
-8. **Arbiter submits to Arkade** — `submit(merged_ark_tx, checkpoint_txs)` via gRPC
-9. **Arkade returns server-signed checkpoints** — server adds its signatures
-10. **Arbiter signs checkpoints** — `sign_checkpoint(cp, arbiter_sk)` for each
-11. **Arbiter returns checkpoints** to Bob for co-signing
-12. **Bob signs checkpoints** — `sign_checkpoint(cp, bob_sk)` or equivalent in TS
-13. **Bob returns signed checkpoints**
-14. **Arbiter merges checkpoint sigs** — `merge_ark_tx_sigs(arbiter_cp, bob_cp)` for each
-15. **Arbiter finalizes** — `finalize(ark_txid, merged_checkpoints)` via gRPC
-16. **Done** — escrow VTXO is spent, Bob receives funds at destination
+3. **Arbiter signs ark_tx** — `sign_ark_tx(ark_tx, arbiter_sk)`
+4. **Arbiter signs checkpoints** — `sign_checkpoint(cp, arbiter_sk)` for each
+5. **Arbiter returns all PSBTs** — arbiter-signed `ark_tx` + arbiter-signed checkpoints
+6. **Bob signs ark_tx** — `sign_ark_tx(ark_tx, bob_sk)` or TS equivalent
+7. **Bob signs checkpoints** — `sign_checkpoint(cp, bob_sk)` for each
+8. **Bob returns all signed PSBTs** to the arbiter
+9. **Arbiter merges ark_tx** — `merge_ark_tx_sigs(arbiter_signed, bob_signed)`
+10. **Arbiter submits to Arkade** — `submit(merged_ark_tx, UNSIGNED_checkpoints)` via gRPC. **Only unsigned checkpoints are sent** — checkpoint signatures must not be revealed to the server before it co-signs the ark_tx.
+11. **Arkade returns server-signed checkpoints** — server adds its signatures to the checkpoints
+12. **Arbiter merges its checkpoint sigs** into the server-signed copies
+13. **Arbiter merges Bob's checkpoint sigs** into the result
+14. **Arbiter finalizes** — `finalize(ark_txid, fully_signed_checkpoints)` via gRPC
+15. **Done** — escrow VTXO is spent, Bob receives funds at destination
+
+### Security invariant
+
+> Checkpoint signatures (arbiter's and Bob's) are **never** sent to the
+> Arkade server before the server co-signs the ark_tx. The `submit` call
+> only includes unsigned checkpoints. This prevents the server from
+> broadcasting checkpoints unilaterally before committing to the ark
+> transaction.
 
 ## Refund Flow
 
@@ -97,23 +103,25 @@ If the Arkade server is unavailable, any collaborative path can be replaced by i
 - The ark_tx PSBT always has the escrow VTXO as **input 0**
 - Signatures are **Schnorr tapscript signatures** (BIP 341)
 - Merging combines `tap_script_sigs` from both PSBTs
+- The `unsigned_tx` is identical before and after server signing — only `tap_script_sigs` differ
 
 ## TypeScript (Frontend) Signing
 
-Frontend clients sign using `@arkade-os/sdk`:
+The `@lendasat/lendaswap-sdk-pure` package provides helpers:
 
 ```typescript
-import { Transaction } from "@arkade-os/sdk";
+import {
+  signEscrowArkTx,
+  signEscrowCheckpoints,
+} from "@lendasat/lendaswap-sdk-pure";
 
-// Sign ark_tx
-const tx = Transaction.fromPSBT(base64ToBytes(psbtB64));
-tx.signIdx(secretKey, 0);
-const signed = bytesToBase64(tx.toPSBT());
+// Sign everything in one go
+const { signedPsbt, txid } = signEscrowArkTx(arkTxPsbtB64, secretKey);
+const signedCheckpoints = signEscrowCheckpoints(checkpointPsbtB64s, secretKey);
 
-// Sign checkpoint
-const cp = Transaction.fromPSBT(base64ToBytes(cpB64));
-cp.signIdx(secretKey, 0);
-const signedCp = bytesToBase64(cp.toPSBT());
+// Send both back to the arbiter
+await api("POST", `/release/sign`, {
+  signed_ark_tx: signedPsbt,
+  signed_checkpoints: signedCheckpoints,
+});
 ```
-
-The `@lendasat/lendaswap-sdk-pure` package provides `signEscrowArkTx()`, `signEscrowCheckpoints()`, and `getArkTxid()` helpers for this.
