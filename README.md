@@ -22,7 +22,7 @@ This SDK provides primitives for building escrow applications where any two of t
 
 ```toml
 [dependencies]
-ark-escrow = { git = "..." }
+ark-escrow = { git = "https://github.com/lendasat/ark-escrow" }
 ```
 
 ### Core types
