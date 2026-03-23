@@ -15,11 +15,11 @@ pub struct EscrowVtxo {
     pub amount: Amount,
 }
 
-/// The result of building a release transaction (step 1).
+/// The result of building an escrow spend transaction (release or refund).
 ///
 /// Contains the ark_tx PSBT (needs signer + server sigs) and the checkpoint
 /// PSBTs that will be signed after server co-signs.
-pub struct ReleaseTransaction {
+pub struct EscrowTransaction {
     pub ark_tx: Psbt,
     pub checkpoint_txs: Vec<Psbt>,
 }
@@ -39,7 +39,7 @@ pub fn build_release_tx(
     bob_dest: &ark_core::ArkAddress,
     fee_dest: Option<(&ark_core::ArkAddress, Amount)>,
     server_info: &server::Info,
-) -> Result<ReleaseTransaction> {
+) -> Result<EscrowTransaction> {
     let spend_script = contract.options().bob_arbiter_script();
     let control_block = contract.control_block(&spend_script)?;
 
@@ -79,11 +79,54 @@ pub fn build_release_tx(
     )
     .context("building release offchain transactions")?;
 
-    Ok(ReleaseTransaction {
+    Ok(EscrowTransaction {
         ark_tx,
         checkpoint_txs,
     })
 }
+
+/// Build a refund transaction (alice + arbiter path).
+///
+/// Returns the full escrow amount to Alice (no fee output).
+pub fn build_refund_tx(
+    contract: &EscrowContract,
+    escrow_vtxo: &EscrowVtxo,
+    alice_dest: &ark_core::ArkAddress,
+    server_info: &server::Info,
+) -> Result<EscrowTransaction> {
+    let spend_script = contract.options().alice_arbiter_script();
+    let control_block = contract.control_block(&spend_script)?;
+
+    let vtxo_input = VtxoInput::new(
+        spend_script,
+        None,
+        control_block,
+        contract.tapscripts(),
+        contract.script_pubkey(),
+        escrow_vtxo.amount,
+        escrow_vtxo.outpoint,
+    );
+
+    let outputs = [(alice_dest, escrow_vtxo.amount)];
+
+    let OffchainTransactions {
+        ark_tx,
+        checkpoint_txs,
+    } = send::build_offchain_transactions(
+        &outputs,
+        None,
+        std::slice::from_ref(&vtxo_input),
+        server_info,
+    )
+    .context("building refund offchain transactions")?;
+
+    Ok(EscrowTransaction {
+        ark_tx,
+        checkpoint_txs,
+    })
+}
+
+// --- Signing helpers ---
 
 /// Sign the ark_tx PSBT with a single keypair (Bob or arbiter).
 ///
@@ -126,12 +169,13 @@ pub fn sign_checkpoint(psbt: &mut Psbt, keypair: &Keypair) -> Result<()> {
     Ok(())
 }
 
-/// Merge Bob's and arbiter's signatures on the ark_tx PSBT.
+// --- Signature merging ---
+
+/// Merge tap_script_sigs from one PSBT into another.
 ///
 /// Takes the base PSBT (with one party's sigs) and merges sigs from another
 /// copy. Both PSBTs must have the same unsigned tx.
 pub fn merge_ark_tx_sigs(base: &mut Psbt, other: &Psbt) -> Result<()> {
-    // Merge tap_script_sigs from the other PSBT into base.
     for (i, other_input) in other.inputs.iter().enumerate() {
         for (key, sig) in &other_input.tap_script_sigs {
             base.inputs[i]
@@ -141,45 +185,4 @@ pub fn merge_ark_tx_sigs(base: &mut Psbt, other: &Psbt) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Build a refund transaction (alice + arbiter path).
-///
-/// Returns the full escrow amount to Alice (no fee output).
-pub fn build_refund_tx(
-    contract: &EscrowContract,
-    escrow_vtxo: &EscrowVtxo,
-    alice_dest: &ark_core::ArkAddress,
-    server_info: &server::Info,
-) -> Result<ReleaseTransaction> {
-    let spend_script = contract.options().alice_arbiter_script();
-    let control_block = contract.control_block(&spend_script)?;
-
-    let vtxo_input = VtxoInput::new(
-        spend_script,
-        None,
-        control_block,
-        contract.tapscripts(),
-        contract.script_pubkey(),
-        escrow_vtxo.amount,
-        escrow_vtxo.outpoint,
-    );
-
-    let outputs = [(alice_dest, escrow_vtxo.amount)];
-
-    let OffchainTransactions {
-        ark_tx,
-        checkpoint_txs,
-    } = send::build_offchain_transactions(
-        &outputs,
-        None,
-        std::slice::from_ref(&vtxo_input),
-        server_info,
-    )
-    .context("building refund offchain transactions")?;
-
-    Ok(ReleaseTransaction {
-        ark_tx,
-        checkpoint_txs,
-    })
 }

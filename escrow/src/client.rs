@@ -6,7 +6,8 @@ use ark_core::server::{self, GetVtxosRequest};
 use bitcoin::{Psbt, Txid};
 
 use crate::contract::EscrowContract;
-use crate::spend::EscrowVtxo;
+use crate::spend::{self, EscrowVtxo};
+use crate::spend_store::{PendingSpend, SpendStore, psbt_from_base64, psbt_to_base64};
 
 /// Wraps an `ark_grpc::Client` with escrow-specific helpers.
 pub struct EscrowClient {
@@ -63,11 +64,124 @@ impl EscrowClient {
         }))
     }
 
-    /// Submit a signed ark_tx + checkpoint PSBTs to the Arkade server.
+    /// Spend an escrow VTXO offchain with crash recovery via the
+    /// [`SpendStore`].
     ///
-    /// Returns the server-signed checkpoint PSBTs. The caller must then sign
-    /// these checkpoints (Bob + arbiter) and call `finalize`.
-    pub async fn submit(&self, ark_tx: Psbt, checkpoint_txs: Vec<Psbt>) -> Result<SubmitResult> {
+    /// Wraps the two-phase Arkade protocol (submit + finalize) with a
+    /// persistence guard so that a crash between the two steps is recoverable.
+    ///
+    /// # Flow
+    ///
+    /// 1. Check the store for a pending spend with `id`. If found, load the
+    ///    fully-signed checkpoints from the store and jump straight to
+    ///    finalization.
+    /// 2. Otherwise: submit the `merged_ark_tx` + `unsigned_checkpoints` to
+    ///    Arkade, merge all checkpoint signatures (server + each party),
+    ///    persist the fully-signed checkpoints, then finalize and clean up.
+    ///
+    /// # Arguments
+    ///
+    /// - `store` — persistence backend for crash recovery.
+    /// - `id` — application-level identifier for deduplication (e.g. trade ID).
+    /// - `merged_ark_tx` — the ark_tx PSBT with all non-server signatures
+    ///   already merged (e.g. arbiter + bob, or arbiter + alice for a refund).
+    /// - `unsigned_checkpoints` — the raw unsigned checkpoint PSBTs (sent to
+    ///   Arkade during submit so the server never sees party checkpoint sigs
+    ///   before co-signing the ark_tx).
+    /// - `party_signed_checkpoints` — each signing party's independently signed
+    ///   checkpoint PSBTs. Outer slice: one entry per party. Inner slice: one
+    ///   PSBT per checkpoint, matching `unsigned_checkpoints` in order.
+    ///
+    /// # Returns
+    ///
+    /// The Arkade transaction ID on success.
+    pub async fn spend_escrow_offchain(
+        &self,
+        store: &impl SpendStore,
+        id: &str,
+        merged_ark_tx: Psbt,
+        unsigned_checkpoints: Vec<Psbt>,
+        party_signed_checkpoints: &[&[Psbt]],
+    ) -> Result<Txid> {
+        // Step 1: Check for a pending spend from a previous attempt.
+        if let Some(pending) = store.load(id).context("loading pending spend")? {
+            let ark_txid: Txid = pending
+                .ark_txid
+                .parse()
+                .context("invalid ark_txid in pending spend")?;
+
+            tracing::info!(%ark_txid, "Resuming finalization of pending spend");
+
+            let final_checkpoints: Vec<Psbt> = pending
+                .signed_checkpoints
+                .iter()
+                .map(|b64| psbt_from_base64(b64))
+                .collect::<Result<_>>()
+                .context("decoding persisted checkpoint PSBTs")?;
+
+            self.finalize_internal(ark_txid, final_checkpoints).await?;
+
+            store.remove(id).context("removing finalized spend")?;
+            return Ok(ark_txid);
+        }
+
+        // Validate checkpoint counts before submitting (can't recover if
+        // submit succeeds but merge fails due to mismatched lengths).
+        let expected = unsigned_checkpoints.len();
+        for (i, party_cps) in party_signed_checkpoints.iter().enumerate() {
+            anyhow::ensure!(
+                party_cps.len() == expected,
+                "party {i} has {} checkpoints, expected {expected}",
+                party_cps.len(),
+            );
+        }
+
+        // Step 2: Fresh submit.
+        let (ark_txid, server_checkpoints) = self
+            .submit_internal(merged_ark_tx, unsigned_checkpoints)
+            .await
+            .context("submitting offchain transaction")?;
+
+        // Step 3: Merge all checkpoint sigs (server + each party).
+        let final_checkpoints =
+            Self::merge_all_checkpoint_sigs(&server_checkpoints, party_signed_checkpoints)?;
+
+        // Persist the fully-signed checkpoints before finalizing so a crash
+        // between submit and finalize is recoverable on the next call.
+        let pending = PendingSpend {
+            id: id.to_string(),
+            ark_txid: ark_txid.to_string(),
+            signed_checkpoints: final_checkpoints.iter().map(psbt_to_base64).collect(),
+        };
+        store.save(&pending).context("persisting pending spend")?;
+
+        tracing::info!(%ark_txid, "Submitted offchain TX, attempting finalization");
+
+        // Step 4: Finalize and clean up.
+        self.finalize_internal(ark_txid, final_checkpoints).await?;
+
+        store.remove(id).context("removing finalized spend")?;
+        Ok(ark_txid)
+    }
+
+    /// Access the underlying gRPC client.
+    pub fn grpc(&self) -> &ark_grpc::Client {
+        &self.grpc
+    }
+
+    // --- Internal helpers ---
+
+    /// Submit a signed ark_tx + unsigned checkpoint PSBTs to the Arkade server.
+    ///
+    /// Returns the ark txid and server-signed checkpoint PSBTs (with
+    /// witness_scripts restored).
+    async fn submit_internal(
+        &self,
+        ark_tx: Psbt,
+        checkpoint_txs: Vec<Psbt>,
+    ) -> Result<(Txid, Vec<Psbt>)> {
+        let ark_txid = ark_tx.unsigned_tx.compute_txid();
+
         let res = self
             .grpc
             .submit_offchain_transaction_request(ark_tx, checkpoint_txs.clone())
@@ -98,15 +212,15 @@ impl EscrowClient {
             })
             .collect();
 
-        Ok(SubmitResult {
-            signed_ark_tx: res.signed_ark_tx,
-            signed_checkpoint_txs: signed_checkpoints,
-        })
+        Ok((ark_txid, signed_checkpoints))
     }
 
-    /// Finalize the offchain transaction after all checkpoint signatures are
-    /// collected.
-    pub async fn finalize(&self, ark_txid: Txid, signed_checkpoint_txs: Vec<Psbt>) -> Result<()> {
+    /// Finalize the offchain transaction with fully-signed checkpoint PSBTs.
+    async fn finalize_internal(
+        &self,
+        ark_txid: Txid,
+        signed_checkpoint_txs: Vec<Psbt>,
+    ) -> Result<()> {
         self.grpc
             .finalize_offchain_transaction(ark_txid, signed_checkpoint_txs)
             .await
@@ -114,13 +228,30 @@ impl EscrowClient {
         Ok(())
     }
 
-    /// Access the underlying gRPC client.
-    pub fn grpc(&self) -> &ark_grpc::Client {
-        &self.grpc
+    /// Merge server-signed checkpoints with each party's signed checkpoints.
+    ///
+    /// For each checkpoint position, starts from the server-signed PSBT and
+    /// merges in every party's `tap_script_sigs`.
+    fn merge_all_checkpoint_sigs(
+        server_checkpoints: &[Psbt],
+        party_signed_checkpoints: &[&[Psbt]],
+    ) -> Result<Vec<Psbt>> {
+        server_checkpoints
+            .iter()
+            .enumerate()
+            .map(|(i, server_cp)| {
+                let mut merged = server_cp.clone();
+                for party_cps in party_signed_checkpoints {
+                    anyhow::ensure!(
+                        party_cps.len() == server_checkpoints.len(),
+                        "party has {} checkpoints, expected {}",
+                        party_cps.len(),
+                        server_checkpoints.len(),
+                    );
+                    spend::merge_ark_tx_sigs(&mut merged, &party_cps[i])?;
+                }
+                Ok(merged)
+            })
+            .collect()
     }
-}
-
-pub struct SubmitResult {
-    pub signed_ark_tx: Psbt,
-    pub signed_checkpoint_txs: Vec<Psbt>,
 }

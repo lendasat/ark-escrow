@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use ark_escrow::client::EscrowClient;
 use ark_escrow::contract::{EscrowContract, EscrowOptions};
 use ark_escrow::spend;
+use ark_escrow::spend_store::FileSpendStore;
 use bitcoin::key::Keypair;
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Amount, Network, Psbt, XOnlyPublicKey};
@@ -115,14 +116,21 @@ impl RbContract {
 #[magnus::wrap(class = "ArkEscrow::Client")]
 struct RbClient {
     inner: Mutex<EscrowClient>,
+    store: FileSpendStore,
     rt: Runtime,
 }
 
 impl RbClient {
-    fn new(url: String) -> Result<Self, Error> {
+    /// Create a new client.
+    ///
+    /// - `url`: Arkade gRPC URL.
+    /// - `store_dir`: directory for persisting pending spends (crash recovery).
+    fn new(url: String, store_dir: String) -> Result<Self, Error> {
         let rt = Runtime::new().map_err(to_magnus_err)?;
+        let store = FileSpendStore::new(&store_dir).map_err(to_magnus_err)?;
         Ok(Self {
             inner: Mutex::new(EscrowClient::new(&url)),
+            store,
             rt,
         })
     }
@@ -203,51 +211,89 @@ impl RbClient {
         Ok((ark_tx_b64, checkpoints_b64))
     }
 
-    /// Submit a signed ark_tx + checkpoints to the server.
-    /// Returns server-signed checkpoint PSBTs (base64 array).
-    fn submit_release(
+    /// Build a refund transaction. Returns the ark_tx PSBT (base64) and
+    /// checkpoint PSBTs (array of base64).
+    fn build_refund(
         &self,
-        signed_ark_tx_b64: String,
-        checkpoint_txs_b64: Vec<String>,
-    ) -> Result<Vec<String>, Error> {
+        contract: &RbContract,
+        escrow_outpoint: String,
+        escrow_amount_sats: u64,
+        alice_dest_address: String,
+    ) -> Result<(String, Vec<String>), Error> {
         let client = self.inner.lock().map_err(to_magnus_err)?;
+        let info = client.server_info().map_err(to_magnus_err)?;
 
-        let ark_tx = psbt_from_base64(&signed_ark_tx_b64)?;
-        let checkpoints: Vec<Psbt> = checkpoint_txs_b64
-            .iter()
-            .map(|b| psbt_from_base64(b))
-            .collect::<Result<_, _>>()?;
+        let outpoint: bitcoin::OutPoint = escrow_outpoint.parse().map_err(to_magnus_err)?;
+        let escrow_vtxo = spend::EscrowVtxo {
+            outpoint,
+            amount: Amount::from_sat(escrow_amount_sats),
+        };
 
-        let result = self
-            .rt
-            .block_on(client.submit(ark_tx, checkpoints))
+        let alice_dest: ark_core::ArkAddress = alice_dest_address.parse().map_err(to_magnus_err)?;
+
+        let refund = spend::build_refund_tx(&contract.inner, &escrow_vtxo, &alice_dest, info)
             .map_err(to_magnus_err)?;
 
-        Ok(result
-            .signed_checkpoint_txs
-            .iter()
-            .map(psbt_to_base64)
-            .collect())
+        let ark_tx_b64 = psbt_to_base64(&refund.ark_tx);
+        let checkpoints_b64: Vec<String> =
+            refund.checkpoint_txs.iter().map(psbt_to_base64).collect();
+
+        Ok((ark_tx_b64, checkpoints_b64))
     }
 
-    /// Finalize the release after Bob signs the checkpoints.
-    fn finalize_release(
+    /// Spend an escrow VTXO offchain with crash recovery.
+    ///
+    /// Wraps the two-phase Arkade protocol (submit + finalize) with a
+    /// persistence guard.
+    ///
+    /// # Arguments
+    ///
+    /// - `id` — unique identifier for deduplication (e.g. trade ID).
+    /// - `merged_ark_tx_b64` — ark_tx PSBT with all non-server sigs merged.
+    /// - `unsigned_checkpoint_txs_b64` — raw unsigned checkpoint PSBTs.
+    /// - `party_signed_checkpoints_b64` — array of arrays: each inner array is
+    ///   one party's signed checkpoint PSBTs (base64).
+    ///
+    /// Returns the Arkade transaction ID (hex string).
+    fn spend_escrow_offchain(
         &self,
-        ark_txid: String,
-        signed_checkpoint_txs_b64: Vec<String>,
-    ) -> Result<(), Error> {
+        id: String,
+        merged_ark_tx_b64: String,
+        unsigned_checkpoint_txs_b64: Vec<String>,
+        party_signed_checkpoints_b64: Vec<Vec<String>>,
+    ) -> Result<String, Error> {
         let client = self.inner.lock().map_err(to_magnus_err)?;
 
-        let txid: bitcoin::Txid = ark_txid.parse().map_err(to_magnus_err)?;
-        let checkpoints: Vec<Psbt> = signed_checkpoint_txs_b64
+        let merged_ark_tx = psbt_from_base64(&merged_ark_tx_b64)?;
+        let unsigned_checkpoints: Vec<Psbt> = unsigned_checkpoint_txs_b64
             .iter()
             .map(|b| psbt_from_base64(b))
             .collect::<Result<_, _>>()?;
 
-        self.rt
-            .block_on(client.finalize(txid, checkpoints))
+        let party_checkpoints: Vec<Vec<Psbt>> = party_signed_checkpoints_b64
+            .iter()
+            .map(|party| {
+                party
+                    .iter()
+                    .map(|b| psbt_from_base64(b))
+                    .collect::<Result<_, _>>()
+            })
+            .collect::<Result<_, _>>()?;
+
+        let party_refs: Vec<&[Psbt]> = party_checkpoints.iter().map(|v| v.as_slice()).collect();
+
+        let txid = self
+            .rt
+            .block_on(client.spend_escrow_offchain(
+                &self.store,
+                &id,
+                merged_ark_tx,
+                unsigned_checkpoints,
+                &party_refs,
+            ))
             .map_err(to_magnus_err)?;
-        Ok(())
+
+        Ok(txid.to_string())
     }
 }
 
@@ -285,7 +331,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     contract_class.define_method("address", method!(RbContract::address, 0))?;
 
     let client_class = module.define_class("Client", ruby.class_object())?;
-    client_class.define_singleton_method("new", function!(RbClient::new, 1))?;
+    client_class.define_singleton_method("new", function!(RbClient::new, 2))?;
     client_class.define_method("connect", method!(RbClient::connect, 0))?;
     client_class.define_method("server_pk", method!(RbClient::server_pk, 0))?;
     client_class.define_method(
@@ -294,8 +340,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     client_class.define_method("find_escrow_vtxo", method!(RbClient::find_escrow_vtxo, 1))?;
     client_class.define_method("build_release", method!(RbClient::build_release, 6))?;
-    client_class.define_method("submit_release", method!(RbClient::submit_release, 2))?;
-    client_class.define_method("finalize_release", method!(RbClient::finalize_release, 2))?;
+    client_class.define_method("build_refund", method!(RbClient::build_refund, 4))?;
+    client_class.define_method(
+        "spend_escrow_offchain",
+        method!(RbClient::spend_escrow_offchain, 4),
+    )?;
 
     module.define_module_function("sign_ark_tx", function!(rb_sign_ark_tx, 2))?;
     module.define_module_function("sign_checkpoint", function!(rb_sign_checkpoint, 2))?;
