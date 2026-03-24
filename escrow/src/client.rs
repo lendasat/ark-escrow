@@ -2,10 +2,14 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use ark_core::VtxoList;
+use ark_core::batch::Delegate;
 use ark_core::server::{self, GetVtxosRequest};
+use bitcoin::key::Keypair;
 use bitcoin::{Psbt, Txid};
+use rand::rngs::OsRng;
 
 use crate::contract::EscrowContract;
+use crate::delegate::DelegateVtxo;
 use crate::spend::{self, EscrowVtxo};
 use crate::spend_store::{PendingSpend, SpendStore, psbt_from_base64, psbt_to_base64};
 
@@ -62,6 +66,65 @@ impl EscrowClient {
             outpoint: v.outpoint,
             amount: v.amount,
         }))
+    }
+
+    /// Find all unspent escrow VTXOs and report whether any are recoverable.
+    ///
+    /// Returns `(vtxos, any_recoverable)` where `vtxos` contains all unspent
+    /// VTXOs at the escrow address and `any_recoverable` is true if offchain
+    /// spending is not possible for at least one of them.
+    pub async fn find_escrow_vtxos(
+        &self,
+        contract: &EscrowContract,
+    ) -> Result<(Vec<DelegateVtxo>, bool)> {
+        let info = self.server_info()?;
+        let address = contract.address();
+
+        let request = GetVtxosRequest::new_for_addresses(std::iter::once(address));
+        let response = self
+            .grpc
+            .list_vtxos(request)
+            .await
+            .context("listing VTXOs")?;
+
+        let vtxo_list = VtxoList::new(info.dust, response.vtxos);
+
+        let mut vtxos = Vec::new();
+        let mut any_recoverable = false;
+
+        for v in vtxo_list.spendable_offchain() {
+            vtxos.push(DelegateVtxo {
+                outpoint: v.outpoint,
+                amount: v.amount,
+                is_swept: v.is_swept,
+            });
+        }
+
+        for v in vtxo_list.recoverable() {
+            any_recoverable = true;
+            vtxos.push(DelegateVtxo {
+                outpoint: v.outpoint,
+                amount: v.amount,
+                is_swept: v.is_swept,
+            });
+        }
+
+        Ok((vtxos, any_recoverable))
+    }
+
+    /// Execute a delegate settlement via the Arkade batch ceremony.
+    ///
+    /// The `delegate` must contain fully-signed intent + forfeit PSBTs (signed
+    /// by all escrow-leaf parties). The `cosigner_kp` is the delegate cosigner
+    /// keypair whose public key was committed in the intent message.
+    ///
+    /// Blocks until the batch ceremony completes (~10-30s). Returns the
+    /// commitment transaction ID.
+    pub async fn settle_delegate(&self, delegate: Delegate, cosigner_kp: Keypair) -> Result<Txid> {
+        let info = self.server_info()?;
+        let mut rng = OsRng;
+
+        crate::delegate::settle_delegate(&self.grpc, info, &mut rng, delegate, cosigner_kp).await
     }
 
     /// Spend an escrow VTXO offchain with crash recovery via the
