@@ -16,7 +16,7 @@ pub struct EscrowOptions {
     pub alice: XOnlyPublicKey,
     /// Bob's public key (the party receiving bitcoin on release).
     pub bob: XOnlyPublicKey,
-    /// Arbiter's public key (HodlHodl).
+    /// Arbiter's public key.
     pub arbiter: XOnlyPublicKey,
     /// Arkade server's public key.
     pub server: XOnlyPublicKey,
