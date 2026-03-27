@@ -144,7 +144,9 @@ impl EscrowClient {
     ///
     /// # Arguments
     ///
-    /// - `store` — persistence backend for crash recovery.
+    /// - `store` — persistence backend for crash recovery. For now, callers
+    ///   may also use this as a local proxy for "pending offchain spend"
+    ///   status until Arkade exposes that status explicitly for escrow VTXOs.
     /// - `id` — application-level identifier for deduplication (e.g. trade ID).
     /// - `merged_ark_tx` — the ark_tx PSBT with all non-server signatures
     ///   already merged (e.g. arbiter + bob, or arbiter + alice for a refund).

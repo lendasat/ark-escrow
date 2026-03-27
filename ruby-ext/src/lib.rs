@@ -195,6 +195,12 @@ impl RbClient {
     /// - `save(id, json)` — persist a pending spend as JSON.
     /// - `load(id) -> json|nil` — load a pending spend by ID.
     /// - `remove(id)` — delete a pending spend after finalization.
+    ///
+    /// For now, callers may also rely on this store to infer whether an
+    /// offchain escrow spend is already pending for a given application-level
+    /// ID. Long-term, Arkade should surface pending spend status for escrow
+    /// VTXOs explicitly so callers do not need to approximate that via the
+    /// local crash-recovery store.
     fn with_custom_store(url: String, rb_store: magnus::Value) -> Result<Self, Error> {
         let rt = Runtime::new().map_err(to_magnus_err)?;
         let store = CallbackSpendStore::new(rb_store);
@@ -239,6 +245,10 @@ impl RbClient {
     ///
     /// Returns `[vtxos_array, any_recoverable]` where vtxos_array is
     /// `[[outpoint, amount_sats, is_swept], ...]`.
+    ///
+    /// Note: this only reflects Arkade-visible VTXO state today. Pending
+    /// offchain spend status is currently inferred separately from the local
+    /// [`SpendStore`] until Arkade surfaces that status explicitly.
     #[allow(clippy::type_complexity)]
     fn find_escrow_vtxos(
         &self,
@@ -254,6 +264,37 @@ impl RbClient {
             .map(|v| (v.outpoint.to_string(), v.amount.to_sat(), v.is_swept))
             .collect();
         Ok((vtxo_data, any_recoverable))
+    }
+
+    /// Get escrow VTXO status for control-flow decisions.
+    ///
+    /// Returns `[pending_offchain, vtxos_array, any_recoverable]` where:
+    /// - `pending_offchain` is true if the local [`SpendStore`] has a pending
+    ///   offchain spend for `id`
+    /// - `vtxos_array` is `[[outpoint, amount_sats, is_swept], ...]`
+    /// - `any_recoverable` indicates whether any escrow VTXO has entered the
+    ///   recoverable path
+    ///
+    /// For now, `pending_offchain` is inferred from the local spend store.
+    /// Once Arkade exposes pending spend status explicitly for escrow VTXOs,
+    /// this method should source that signal from Arkade instead.
+    #[allow(clippy::type_complexity)]
+    fn get_escrow_vtxo_status(
+        &self,
+        id: String,
+        contract: &RbContract,
+    ) -> Result<(bool, Vec<(String, u64, bool)>, bool), Error> {
+        let pending_offchain = self.store.load(&id).map_err(to_magnus_err)?.is_some();
+        let client = self.inner.lock().map_err(to_magnus_err)?;
+        let (vtxos, any_recoverable) = self
+            .rt
+            .block_on(client.find_escrow_vtxos(&contract.inner))
+            .map_err(to_magnus_err)?;
+        let vtxo_data: Vec<(String, u64, bool)> = vtxos
+            .iter()
+            .map(|v| (v.outpoint.to_string(), v.amount.to_sat(), v.is_swept))
+            .collect();
+        Ok((pending_offchain, vtxo_data, any_recoverable))
     }
 
     /// Prepare unsigned delegate release PSBTs.
@@ -575,6 +616,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     client_class.define_method("find_escrow_vtxo", method!(RbClient::find_escrow_vtxo, 1))?;
     client_class.define_method("find_escrow_vtxos", method!(RbClient::find_escrow_vtxos, 1))?;
+    client_class.define_method(
+        "get_escrow_vtxo_status",
+        method!(RbClient::get_escrow_vtxo_status, 2),
+    )?;
     client_class.define_method("build_release", method!(RbClient::build_release, 6))?;
     client_class.define_method("build_refund", method!(RbClient::build_refund, 4))?;
     client_class.define_method(
