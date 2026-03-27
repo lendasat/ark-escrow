@@ -4,11 +4,12 @@ use ark_escrow::client::EscrowClient;
 use ark_escrow::contract::{EscrowContract, EscrowOptions};
 use ark_escrow::delegate::{self, DelegateVtxo};
 use ark_escrow::spend;
-use ark_escrow::spend_store::FileSpendStore;
+use ark_escrow::spend_store::{FileSpendStore, PendingSpend, SpendStore};
 use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1};
 use bitcoin::{Amount, Network, Psbt, XOnlyPublicKey};
 use magnus::prelude::*;
+use magnus::value::Opaque;
 use magnus::{Error, Ruby, function, method};
 use tokio::runtime::Runtime;
 
@@ -69,6 +70,58 @@ fn psbt_from_base64(s: &str) -> Result<Psbt, Error> {
     Psbt::deserialize(&bytes).map_err(to_magnus_err)
 }
 
+// --- Callback-based SpendStore ---
+
+/// A [`SpendStore`] that delegates to a Ruby object responding to
+/// `save(id, json)`, `load(id) -> json|nil`, and `remove(id)`.
+///
+/// Uses [`Opaque`] so the Ruby value can be stored in a `Send + Sync` struct.
+struct CallbackSpendStore {
+    /// The Ruby object wrapped in `Opaque` for thread-safety.
+    rb_store: Opaque<magnus::Value>,
+}
+
+impl CallbackSpendStore {
+    fn new(rb_store: magnus::Value) -> Self {
+        Self {
+            rb_store: Opaque::from(rb_store),
+        }
+    }
+}
+
+impl SpendStore for CallbackSpendStore {
+    fn save(&self, spend: &PendingSpend) -> anyhow::Result<()> {
+        let ruby = Ruby::get().expect("called from Ruby thread");
+        let store = ruby.get_inner(self.rb_store);
+        let json = serde_json::to_string(spend)?;
+        let _: magnus::Value = store
+            .funcall("save", (spend.id.as_str(), json.as_str()))
+            .map_err(|e| anyhow::anyhow!("Ruby store#save failed: {e}"))?;
+        Ok(())
+    }
+
+    fn load(&self, id: &str) -> anyhow::Result<Option<PendingSpend>> {
+        let ruby = Ruby::get().expect("called from Ruby thread");
+        let store = ruby.get_inner(self.rb_store);
+        let result: Option<String> = store
+            .funcall("load", (id,))
+            .map_err(|e| anyhow::anyhow!("Ruby store#load failed: {e}"))?;
+        match result {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn remove(&self, id: &str) -> anyhow::Result<()> {
+        let ruby = Ruby::get().expect("called from Ruby thread");
+        let store = ruby.get_inner(self.rb_store);
+        let _: magnus::Value = store
+            .funcall("remove", (id,))
+            .map_err(|e| anyhow::anyhow!("Ruby store#remove failed: {e}"))?;
+        Ok(())
+    }
+}
+
 // --- Ruby wrappers ---
 
 /// Ruby class: `ArkEscrow::Contract`
@@ -117,21 +170,37 @@ impl RbContract {
 #[magnus::wrap(class = "ArkEscrow::Client")]
 struct RbClient {
     inner: Mutex<EscrowClient>,
-    store: FileSpendStore,
+    store: Box<dyn SpendStore + Send + Sync>,
     rt: Runtime,
 }
 
 impl RbClient {
-    /// Create a new client.
+    /// Create a client with file-based crash-recovery storage.
     ///
     /// - `url`: Arkade gRPC URL.
-    /// - `store_dir`: directory for persisting pending spends (crash recovery).
-    fn new(url: String, store_dir: String) -> Result<Self, Error> {
+    /// - `store_dir`: directory for persisting pending spends.
+    fn with_file_store(url: String, store_dir: String) -> Result<Self, Error> {
         let rt = Runtime::new().map_err(to_magnus_err)?;
         let store = FileSpendStore::new(&store_dir).map_err(to_magnus_err)?;
         Ok(Self {
             inner: Mutex::new(EscrowClient::new(&url)),
-            store,
+            store: Box::new(store),
+            rt,
+        })
+    }
+
+    /// Create a client with a custom Ruby store object for crash recovery.
+    ///
+    /// The store object must respond to:
+    /// - `save(id, json)` — persist a pending spend as JSON.
+    /// - `load(id) -> json|nil` — load a pending spend by ID.
+    /// - `remove(id)` — delete a pending spend after finalization.
+    fn with_custom_store(url: String, rb_store: magnus::Value) -> Result<Self, Error> {
+        let rt = Runtime::new().map_err(to_magnus_err)?;
+        let store = CallbackSpendStore::new(rb_store);
+        Ok(Self {
+            inner: Mutex::new(EscrowClient::new(&url)),
+            store: Box::new(store),
             rt,
         })
     }
@@ -406,7 +475,7 @@ impl RbClient {
         let txid = self
             .rt
             .block_on(client.spend_escrow_offchain(
-                &self.store,
+                &*self.store,
                 &id,
                 merged_ark_tx,
                 unsigned_checkpoints,
@@ -492,7 +561,12 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     contract_class.define_method("address", method!(RbContract::address, 0))?;
 
     let client_class = module.define_class("Client", ruby.class_object())?;
-    client_class.define_singleton_method("new", function!(RbClient::new, 2))?;
+    client_class
+        .define_singleton_method("with_file_store", function!(RbClient::with_file_store, 2))?;
+    client_class.define_singleton_method(
+        "with_custom_store",
+        function!(RbClient::with_custom_store, 2),
+    )?;
     client_class.define_method("connect", method!(RbClient::connect, 0))?;
     client_class.define_method("server_pk", method!(RbClient::server_pk, 0))?;
     client_class.define_method(

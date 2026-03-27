@@ -160,7 +160,7 @@ impl EscrowClient {
     /// The Arkade transaction ID on success.
     pub async fn spend_escrow_offchain(
         &self,
-        store: &impl SpendStore,
+        store: &(impl SpendStore + ?Sized),
         id: &str,
         merged_ark_tx: Psbt,
         unsigned_checkpoints: Vec<Psbt>,

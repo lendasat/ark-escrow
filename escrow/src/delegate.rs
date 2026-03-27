@@ -325,7 +325,8 @@ pub async fn settle_delegate<R: Rng + CryptoRng>(
                     let agg_nonce_pk = aggregate_nonces(e.nonces);
                     agg_nonce_pks.insert(e.txid, agg_nonce_pk);
 
-                    let vg = vtxo_graph.as_ref()
+                    let vg = vtxo_graph
+                        .as_ref()
                         .context("tree nonces received before signing started")?;
 
                     if agg_nonce_pks.len() == vg.nb_of_nodes() {
