@@ -4,7 +4,7 @@ use ark_escrow::client::EscrowClient;
 use ark_escrow::contract::{EscrowContract, EscrowOptions};
 use ark_escrow::delegate::{self, DelegateVtxo};
 use ark_escrow::spend_store::{FileSpendStore, PendingSpend, SpendStore};
-use ark_escrow::{FeeOutput, spend};
+use ark_escrow::{FeeOutput, ReleaseMode, plan_release, spend};
 use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1};
 use bitcoin::{Amount, Network, Psbt, XOnlyPublicKey};
@@ -68,6 +68,20 @@ fn psbt_from_base64(s: &str) -> Result<Psbt, Error> {
     use bitcoin::base64::{Engine, engine::general_purpose::STANDARD};
     let bytes = STANDARD.decode(s).map_err(to_magnus_err)?;
     Psbt::deserialize(&bytes).map_err(to_magnus_err)
+}
+
+fn parse_fee_outputs(fee_outputs: Vec<(String, u64)>) -> Result<Vec<FeeOutput>, Error> {
+    fee_outputs
+        .iter()
+        .map(|(address, amount)| {
+            let address = address.parse()?;
+            Ok::<_, ark_core::Error>(FeeOutput {
+                address,
+                amount: Amount::from_sat(*amount),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_magnus_err)
 }
 
 // --- Callback-based SpendStore ---
@@ -297,6 +311,50 @@ impl RbClient {
         Ok((pending_offchain, vtxo_data, any_recoverable))
     }
 
+    /// Quote a release without building PSBTs.
+    ///
+    /// Returns `[bob_amount_sats, effective_fee_outputs, discarded_fee_outputs]`
+    /// where each fee-output array contains `[address, amount_sats]` tuples.
+    #[allow(clippy::type_complexity)]
+    fn quote_release(
+        &self,
+        escrow_amount_sats: u64,
+        fee_outputs: Vec<(String, u64)>,
+        use_delegate: bool,
+    ) -> Result<(u64, Vec<(String, u64)>, Vec<(String, u64)>), Error> {
+        let client = self.inner.lock().map_err(to_magnus_err)?;
+        let info = client.server_info().map_err(to_magnus_err)?;
+        let fee_outputs = parse_fee_outputs(fee_outputs)?;
+        let release_plan = plan_release(
+            Amount::from_sat(escrow_amount_sats),
+            &fee_outputs,
+            if use_delegate {
+                ReleaseMode::Delegate
+            } else {
+                ReleaseMode::Offchain
+            },
+            info.dust,
+        )
+        .map_err(to_magnus_err)?;
+
+        let effective_fee_outputs = release_plan
+            .effective_fee_outputs
+            .iter()
+            .map(|o| (o.address.to_string(), o.amount.to_sat()))
+            .collect();
+        let discarded_fee_outputs = release_plan
+            .discarded_fee_outputs
+            .iter()
+            .map(|o| (o.address.to_string(), o.amount.to_sat()))
+            .collect();
+
+        Ok((
+            release_plan.bob_amount.to_sat(),
+            effective_fee_outputs,
+            discarded_fee_outputs,
+        ))
+    }
+
     /// Prepare unsigned delegate release PSBTs.
     ///
     /// Returns `[intent_proof_b64, intent_message_json, forfeit_psbts_b64[], cosigner_pk_hex]`.
@@ -324,18 +382,7 @@ impl RbClient {
             .collect::<Result<_, Error>>()?;
 
         let bob_dest: ark_core::ArkAddress = bob_dest_address.parse().map_err(to_magnus_err)?;
-
-        let fee_outputs = fee_outputs
-            .iter()
-            .map(|(address, amount)| {
-                let address = address.parse()?;
-                Ok::<_, ark_core::Error>(FeeOutput {
-                    address,
-                    amount: Amount::from_sat(*amount),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(to_magnus_err)?;
+        let fee_outputs = parse_fee_outputs(fee_outputs)?;
 
         let cosigner_kp = parse_secret_key(&cosigner_sk_hex)?;
         let cosigner_pk = cosigner_kp.public_key();
@@ -421,18 +468,7 @@ impl RbClient {
         };
 
         let bob_dest: ark_core::ArkAddress = bob_dest_address.parse().map_err(to_magnus_err)?;
-
-        let fee_outputs = fee_outputs
-            .iter()
-            .map(|(address, amount)| {
-                let address = address.parse()?;
-                Ok::<_, ark_core::Error>(FeeOutput {
-                    address,
-                    amount: Amount::from_sat(*amount),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(to_magnus_err)?;
+        let fee_outputs = parse_fee_outputs(fee_outputs)?;
 
         let release =
             spend::build_release_tx(&contract.inner, &escrow_vtxo, &bob_dest, &fee_outputs, info)
@@ -621,6 +657,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "get_escrow_vtxo_status",
         method!(RbClient::get_escrow_vtxo_status, 2),
     )?;
+    client_class.define_method("quote_release", method!(RbClient::quote_release, 3))?;
     client_class.define_method("build_release", method!(RbClient::build_release, 5))?;
     client_class.define_method("build_refund", method!(RbClient::build_refund, 4))?;
     client_class.define_method(

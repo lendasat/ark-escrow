@@ -28,8 +28,8 @@ use bitcoin::secp256k1::{self, Secp256k1, schnorr};
 use bitcoin::{Amount, OutPoint, ScriptBuf, Txid, XOnlyPublicKey};
 use rand::{CryptoRng, Rng};
 
-use crate::FeeOutput;
 use crate::contract::EscrowContract;
+use crate::{FeeOutput, ReleaseMode, plan_release};
 
 /// Everything needed to describe an escrow VTXO for delegate settlement.
 ///
@@ -72,36 +72,23 @@ pub fn prepare_release_delegate(
     );
 
     let total_escrow_amount: Amount = vtxos.iter().map(|v| v.amount).sum();
+    let release_plan = plan_release(
+        total_escrow_amount,
+        fee_outputs,
+        ReleaseMode::Delegate,
+        server_info.dust,
+    )?;
 
-    // Filter out sub-dust fee outputs.
-    let fee_outputs = fee_outputs
-        .iter()
-        .filter(|o| {
-            if o.amount >= server_info.dust {
-                true
-            } else {
-                tracing::warn!(fee_output = ?o, "Sub-dust fee output cannot be generated via settlement");
-                false
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let total_fee = fee_outputs.iter().map(|o| o.amount).sum();
-
-    let bob_amount = total_escrow_amount
-        .checked_sub(total_fee)
-        .with_context(|| {
-            format!(
-                "fee exceeds amount locked up in escrow contract: {total_fee} > {total_escrow_amount}",
-            )
-        })?;
+    for fee_output in &release_plan.discarded_fee_outputs {
+        tracing::warn!(fee_output = ?fee_output, "Sub-dust fee output cannot be generated via settlement");
+    }
 
     let mut outputs = vec![intent::Output::Offchain(bitcoin::TxOut {
         script_pubkey: bob_dest.to_p2tr_script_pubkey(),
-        value: bob_amount,
+        value: release_plan.bob_amount,
     })];
 
-    for fee_output in fee_outputs {
+    for fee_output in &release_plan.effective_fee_outputs {
         outputs.push(intent::Output::Offchain(bitcoin::TxOut {
             script_pubkey: fee_output.address.to_p2tr_script_pubkey(),
             value: fee_output.amount,

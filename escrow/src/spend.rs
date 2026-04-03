@@ -5,8 +5,8 @@ use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1, schnorr};
 use bitcoin::{Amount, OutPoint, Psbt, XOnlyPublicKey};
 
-use crate::FeeOutput;
 use crate::contract::EscrowContract;
+use crate::{FeeOutput, ReleaseMode, plan_release};
 
 /// Everything needed to describe an escrow VTXO that will be spent.
 pub struct EscrowVtxo {
@@ -54,19 +54,17 @@ pub fn build_release_tx(
         escrow_vtxo.outpoint,
     );
 
+    let release_plan = plan_release(
+        escrow_vtxo.amount,
+        fee_outputs,
+        ReleaseMode::Offchain,
+        server_info.dust,
+    )?;
+
     let mut outputs: Vec<(&ark_core::ArkAddress, Amount)> = Vec::new();
+    outputs.push((bob_dest, release_plan.bob_amount));
 
-    let total_fee = fee_outputs.iter().map(|o| o.amount).sum();
-    let bob_amount = escrow_vtxo.amount.checked_sub(total_fee).with_context(|| {
-        format!(
-            "fee exceeds amount locked up in escrow contract: {total_fee} > {}",
-            escrow_vtxo.amount
-        )
-    })?;
-
-    outputs.push((bob_dest, bob_amount));
-
-    for fee_output in fee_outputs {
+    for fee_output in &release_plan.effective_fee_outputs {
         outputs.push((&fee_output.address, fee_output.amount));
     }
 
