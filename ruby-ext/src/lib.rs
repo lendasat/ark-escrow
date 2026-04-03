@@ -632,6 +632,16 @@ fn rb_merge_sigs(base_b64: String, other_b64: String) -> Result<String, Error> {
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
+    // Init tracing so Rust logs are visible. Controlled by RUST_LOG env var.
+    // e.g. RUST_LOG=ark_escrow=debug,ark_escrow_ruby=debug
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "ark_escrow=info,ark_escrow_ruby=info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let module = ruby.define_module("ArkEscrow")?;
 
     let contract_class = module.define_class("Contract", ruby.class_object())?;
