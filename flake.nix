@@ -28,6 +28,7 @@
             # Rust
             rustToolchain
             rustfmt
+            rust-analyzer
             pkg-config
             openssl
             gcc

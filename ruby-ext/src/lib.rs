@@ -3,8 +3,8 @@ use std::sync::Mutex;
 use ark_escrow::client::EscrowClient;
 use ark_escrow::contract::{EscrowContract, EscrowOptions};
 use ark_escrow::delegate::{self, DelegateVtxo};
-use ark_escrow::spend;
 use ark_escrow::spend_store::{FileSpendStore, PendingSpend, SpendStore};
+use ark_escrow::{FeeOutput, spend};
 use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1};
 use bitcoin::{Amount, Network, Psbt, XOnlyPublicKey};
@@ -305,8 +305,7 @@ impl RbClient {
         contract: &RbContract,
         vtxos_data: Vec<(String, u64, bool)>,
         bob_dest_address: String,
-        fee_dest_address: Option<String>,
-        fee_sats: Option<u64>,
+        fee_outputs: Vec<(String, u64)>,
         cosigner_sk_hex: String,
     ) -> Result<(String, String, Vec<String>, String), Error> {
         let client = self.inner.lock().map_err(to_magnus_err)?;
@@ -326,13 +325,17 @@ impl RbClient {
 
         let bob_dest: ark_core::ArkAddress = bob_dest_address.parse().map_err(to_magnus_err)?;
 
-        let fee_dest = match (fee_dest_address, fee_sats) {
-            (Some(addr), Some(sats)) => {
-                let fee_addr: ark_core::ArkAddress = addr.parse().map_err(to_magnus_err)?;
-                Some((fee_addr, Amount::from_sat(sats)))
-            }
-            _ => None,
-        };
+        let fee_outputs = fee_outputs
+            .iter()
+            .map(|(address, amount)| {
+                let address = address.parse()?;
+                Ok::<_, ark_core::Error>(FeeOutput {
+                    address,
+                    amount: Amount::from_sat(*amount),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_magnus_err)?;
 
         let cosigner_kp = parse_secret_key(&cosigner_sk_hex)?;
         let cosigner_pk = cosigner_kp.public_key();
@@ -341,7 +344,7 @@ impl RbClient {
             &contract.inner,
             &vtxos,
             &bob_dest,
-            fee_dest.as_ref().map(|(a, s)| (a, *s)),
+            &fee_outputs,
             cosigner_pk,
             info,
         )
@@ -406,8 +409,7 @@ impl RbClient {
         escrow_outpoint: String,
         escrow_amount_sats: u64,
         bob_dest_address: String,
-        fee_dest_address: Option<String>,
-        fee_sats: Option<u64>,
+        fee_outputs: Vec<(String, u64)>,
     ) -> Result<(String, Vec<String>), Error> {
         let client = self.inner.lock().map_err(to_magnus_err)?;
         let info = client.server_info().map_err(to_magnus_err)?;
@@ -420,22 +422,21 @@ impl RbClient {
 
         let bob_dest: ark_core::ArkAddress = bob_dest_address.parse().map_err(to_magnus_err)?;
 
-        let fee_dest = match (fee_dest_address, fee_sats) {
-            (Some(addr), Some(sats)) => {
-                let fee_addr: ark_core::ArkAddress = addr.parse().map_err(to_magnus_err)?;
-                Some((fee_addr, Amount::from_sat(sats)))
-            }
-            _ => None,
-        };
+        let fee_outputs = fee_outputs
+            .iter()
+            .map(|(address, amount)| {
+                let address = address.parse()?;
+                Ok::<_, ark_core::Error>(FeeOutput {
+                    address,
+                    amount: Amount::from_sat(*amount),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_magnus_err)?;
 
-        let release = spend::build_release_tx(
-            &contract.inner,
-            &escrow_vtxo,
-            &bob_dest,
-            fee_dest.as_ref().map(|(a, s)| (a, *s)),
-            info,
-        )
-        .map_err(to_magnus_err)?;
+        let release =
+            spend::build_release_tx(&contract.inner, &escrow_vtxo, &bob_dest, &fee_outputs, info)
+                .map_err(to_magnus_err)?;
 
         let ark_tx_b64 = psbt_to_base64(&release.ark_tx);
         let checkpoints_b64: Vec<String> =
@@ -620,7 +621,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "get_escrow_vtxo_status",
         method!(RbClient::get_escrow_vtxo_status, 2),
     )?;
-    client_class.define_method("build_release", method!(RbClient::build_release, 6))?;
+    client_class.define_method("build_release", method!(RbClient::build_release, 5))?;
     client_class.define_method("build_refund", method!(RbClient::build_refund, 4))?;
     client_class.define_method(
         "spend_escrow_offchain",
@@ -628,7 +629,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     client_class.define_method(
         "prepare_release_delegate",
-        method!(RbClient::prepare_release_delegate, 6),
+        method!(RbClient::prepare_release_delegate, 5),
     )?;
     client_class.define_method("settle_delegate", method!(RbClient::settle_delegate, 4))?;
 

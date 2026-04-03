@@ -5,6 +5,7 @@ use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1, schnorr};
 use bitcoin::{Amount, OutPoint, Psbt, XOnlyPublicKey};
 
+use crate::FeeOutput;
 use crate::contract::EscrowContract;
 
 /// Everything needed to describe an escrow VTXO that will be spent.
@@ -37,7 +38,7 @@ pub fn build_release_tx(
     contract: &EscrowContract,
     escrow_vtxo: &EscrowVtxo,
     bob_dest: &ark_core::ArkAddress,
-    fee_dest: Option<(&ark_core::ArkAddress, Amount)>,
+    fee_outputs: &[FeeOutput],
     server_info: &server::Info,
 ) -> Result<EscrowTransaction> {
     let spend_script = contract.options().bob_arbiter_script();
@@ -55,17 +56,18 @@ pub fn build_release_tx(
 
     let mut outputs: Vec<(&ark_core::ArkAddress, Amount)> = Vec::new();
 
-    let bob_amount = match fee_dest {
-        Some((_, fee)) => escrow_vtxo
-            .amount
-            .checked_sub(fee)
-            .context("fee exceeds escrow amount")?,
-        None => escrow_vtxo.amount,
-    };
+    let total_fee = fee_outputs.iter().map(|o| o.amount).sum();
+    let bob_amount = escrow_vtxo.amount.checked_sub(total_fee).with_context(|| {
+        format!(
+            "fee exceeds amount locked up in escrow contract: {total_fee} > {}",
+            escrow_vtxo.amount
+        )
+    })?;
+
     outputs.push((bob_dest, bob_amount));
 
-    if let Some((fee_addr, fee_amount)) = &fee_dest {
-        outputs.push((fee_addr, *fee_amount));
+    for fee_output in fee_outputs {
+        outputs.push((&fee_output.address, fee_output.amount));
     }
 
     let OffchainTransactions {

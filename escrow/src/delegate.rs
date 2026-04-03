@@ -28,6 +28,7 @@ use bitcoin::secp256k1::{self, Secp256k1, schnorr};
 use bitcoin::{Amount, OutPoint, ScriptBuf, Txid, XOnlyPublicKey};
 use rand::{CryptoRng, Rng};
 
+use crate::FeeOutput;
 use crate::contract::EscrowContract;
 
 /// Everything needed to describe an escrow VTXO for delegate settlement.
@@ -53,7 +54,7 @@ pub fn prepare_release_delegate(
     contract: &EscrowContract,
     vtxos: &[DelegateVtxo],
     bob_dest: &ark_core::ArkAddress,
-    fee_dest: Option<(&ark_core::ArkAddress, Amount)>,
+    fee_outputs: &[FeeOutput],
     delegate_cosigner_pk: secp256k1::PublicKey,
     server_info: &server::Info,
 ) -> Result<Delegate> {
@@ -70,22 +71,26 @@ pub fn prepare_release_delegate(
         &script_pubkey,
     );
 
-    let total: Amount = vtxos.iter().map(|v| v.amount).sum();
-    let bob_amount = match fee_dest {
-        Some((_, fee)) => total
-            .checked_sub(fee)
-            .context("fee exceeds escrow amount")?,
-        None => total,
-    };
+    let total_escrow_amount: Amount = vtxos.iter().map(|v| v.amount).sum();
+    let total_fee = fee_outputs.iter().map(|o| o.amount).sum();
+
+    let bob_amount = total_escrow_amount
+        .checked_sub(total_fee)
+        .with_context(|| {
+            format!(
+                "fee exceeds amount locked up in escrow contract: {total_fee} > {total_escrow_amount}",
+            )
+        })?;
 
     let mut outputs = vec![intent::Output::Offchain(bitcoin::TxOut {
         script_pubkey: bob_dest.to_p2tr_script_pubkey(),
         value: bob_amount,
     })];
-    if let Some((fee_addr, fee_amount)) = fee_dest {
+
+    for fee_output in fee_outputs {
         outputs.push(intent::Output::Offchain(bitcoin::TxOut {
-            script_pubkey: fee_addr.to_p2tr_script_pubkey(),
-            value: fee_amount,
+            script_pubkey: fee_output.address.to_p2tr_script_pubkey(),
+            value: fee_output.amount,
         }));
     }
 
