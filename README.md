@@ -28,15 +28,23 @@ ark-escrow = { git = "https://github.com/lendasat/ark-escrow" }
 ### Core types
 
 - **`EscrowContract`** — builds the taproot tree from 4 public keys + CSV delay
-- **`EscrowClient`** — wraps Arkade gRPC (connect, find VTXO, submit, finalize)
-- **`build_release_tx`** / **`build_refund_tx`** — construct unsigned PSBTs
-- **`sign_ark_tx`** / **`sign_checkpoint`** — Schnorr signing helpers
+- **`EscrowClient`** — wraps Arkade gRPC (connect, find VTXOs, offchain spend with crash recovery, delegate settlement)
+- **`build_release_tx`** / **`build_refund_tx`** — construct unsigned offchain release/refund PSBTs
+- **`prepare_release_delegate`** — construct unsigned delegate settlement PSBTs (for recoverable VTXOs)
+- **`plan_release`** — compute effective payout and fee outputs without building PSBTs
+- **`sign_ark_tx`** / **`sign_checkpoint`** / **`sign_delegate`** — Schnorr signing helpers
 - **`merge_ark_tx_sigs`** — merge signatures from multiple parties
+- **`SpendStore`** trait — pluggable crash-recovery storage for the two-phase offchain spend protocol
 
 ### Example
 
 ```rust
-use ark_escrow::{contract::{EscrowContract, EscrowOptions}, client::EscrowClient, spend};
+use ark_escrow::{
+    FeeOutput,
+    contract::{EscrowContract, EscrowOptions},
+    client::EscrowClient,
+    spend,
+};
 
 // 1. Create contract
 let contract = EscrowContract::new(EscrowOptions {
@@ -47,31 +55,37 @@ let contract = EscrowContract::new(EscrowOptions {
 // 2. Connect to Arkade and find the funded VTXO
 let mut client = EscrowClient::new("https://arkade.computer:7070");
 let info = client.connect().await?;
-let vtxo = client.find_escrow_vtxo(&contract).await?;
+let vtxo = client.find_escrow_vtxo(&contract).await?
+    .expect("escrow VTXO not found");
 
-// 3. Build release transaction
-let release = spend::build_release_tx(&contract, &vtxo, &bob_addr, fee, info)?;
+// 3. Build release transaction (with fee outputs)
+let fee_outputs = vec![
+    FeeOutput { address: fee_addr, amount: Amount::from_sat(100) },
+];
+let release = spend::build_release_tx(
+    &contract, &vtxo, &bob_addr, &fee_outputs, info,
+)?;
 
 // 4. Sign (each party signs independently)
 spend::sign_ark_tx(&mut release.ark_tx, &bob_keypair)?;
 spend::sign_ark_tx(&mut arbiter_copy, &arbiter_keypair)?;
 spend::merge_ark_tx_sigs(&mut release.ark_tx, &arbiter_copy)?;
 
-// 5. Submit and finalize
-let result = client.submit(release.ark_tx, release.checkpoint_txs).await?;
-// ... sign checkpoints, then finalize
+// 5. Submit and finalize (with crash recovery via SpendStore)
+let txid = client.spend_escrow_offchain(
+    &store, "trade-id", release.ark_tx, release.checkpoint_txs, &party_cps,
+).await?;
 ```
 
-## Ruby gem (`ark_escrow`)
+## Ruby FFI (`ark_escrow`)
 
-Native extension providing the same primitives to Ruby via FFI.
+Native extension providing the same primitives to Ruby.
 
 ### Build
 
 ```bash
 cargo build --release -p ark-escrow-ruby
-# Symlink the shared library
-ln -sf target/release/libark_escrow_ruby.so target/release/ark_escrow_ruby.so  # Linux
+ln -sf target/release/libark_escrow_ruby.so target/release/ark_escrow_ruby.so      # Linux
 ln -sf target/release/libark_escrow_ruby.dylib target/release/ark_escrow_ruby.bundle  # macOS
 ```
 
@@ -80,8 +94,8 @@ ln -sf target/release/libark_escrow_ruby.dylib target/release/ark_escrow_ruby.bu
 ```ruby
 require 'ark_escrow'
 
-# Connect to Arkade
-client = ArkEscrow::Client.new("https://arkade.computer:7070")
+# Connect to Arkade (with a custom crash-recovery store)
+client = ArkEscrow::Client.with_custom_store("https://arkade.computer:7070", my_store)
 client.connect
 
 # Create contract
@@ -93,18 +107,49 @@ contract = ArkEscrow::Contract.new(
 # Find funded VTXO
 outpoint, amount = client.find_escrow_vtxo(contract)
 
-# Build release
+# Build release (with fee outputs as [address, sats] pairs)
+fee_outputs = [["ark1...fee", 100]]
 ark_tx_b64, checkpoint_b64s = client.build_release(
-  contract, outpoint, amount, bob_dest_address, fee_address, fee_sats
+  contract, outpoint, amount, bob_dest_address, fee_outputs
 )
 
 # Sign and merge
 signed = ArkEscrow.sign_ark_tx(ark_tx_b64, secret_key_hex)
 merged = ArkEscrow.merge_sigs(signed, other_signed)
 
-# Submit and finalize
-server_checkpoints = client.submit_release(merged, checkpoint_b64s)
-client.finalize_release(ark_txid, signed_checkpoints)
+# Finalize with crash recovery
+ark_txid = client.spend_escrow_offchain(
+  trade_id, merged, unsigned_checkpoints, [arbiter_cps, bob_cps]
+)
+```
+
+### Delegate settlement (recoverable VTXOs)
+
+When escrow VTXOs become recoverable (expired from the VTXO tree), the offchain spend path is no longer available. Instead, use delegate settlement via an Arkade batch ceremony:
+
+```ruby
+# Check VTXO status
+pending, vtxos, any_recoverable = client.get_escrow_vtxo_status(trade_id, contract)
+
+# Quote the release (accounts for dust filtering in delegate mode)
+bob_amount, effective_fees, discarded_fees =
+  client.quote_release(escrow_amount, fee_outputs, any_recoverable)
+
+# Prepare + sign + settle
+intent_b64, message_json, forfeit_b64s, cosigner_pk =
+  client.prepare_release_delegate(contract, vtxos, bob_dest, fee_outputs, cosigner_sk)
+
+signed_intent, signed_forfeits = ArkEscrow.sign_delegate(intent_b64, forfeit_b64s, bob_sk)
+# ... merge arbiter + bob sigs, then:
+txid = client.settle_delegate(signed_intent, message_json, signed_forfeits, cosigner_sk)
+```
+
+### Rust logging
+
+The Ruby extension initialises a `tracing` subscriber on load. Control verbosity via `RUST_LOG`:
+
+```bash
+RUST_LOG=ark_escrow=debug ruby my_app.rb
 ```
 
 ## Protocol
