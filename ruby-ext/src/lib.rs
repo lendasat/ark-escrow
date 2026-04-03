@@ -640,7 +640,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
                 .unwrap_or_else(|_| "ark_escrow=info,ark_escrow_ruby=info".into()),
         )
         .with_writer(std::io::stderr)
-        .init();
+        .try_init()
+        .ok();
 
     let module = ruby.define_module("ArkEscrow")?;
 
