@@ -72,6 +72,20 @@ pub fn prepare_release_delegate(
     );
 
     let total_escrow_amount: Amount = vtxos.iter().map(|v| v.amount).sum();
+
+    // Filter out sub-dust fee outputs.
+    let fee_outputs = fee_outputs
+        .iter()
+        .filter(|o| {
+            if o.amount >= server_info.dust {
+                true
+            } else {
+                tracing::warn!(fee_output = ?o, "Sub-dust fee output cannot be generated via settlement");
+                false
+            }
+        })
+        .collect::<Vec<_>>();
+
     let total_fee = fee_outputs.iter().map(|o| o.amount).sum();
 
     let bob_amount = total_escrow_amount
